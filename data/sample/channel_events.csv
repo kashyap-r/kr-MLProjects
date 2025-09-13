@@ -1,0 +1,5 @@
+customer_id,ts,channel,event,session_id
+C001,2025-09-10T09:10:12Z,app,login,S123
+C001,2025-09-10T09:12:55Z,app,trade_submit,S123
+C002,2025-09-10T11:03:44Z,call,service_request,S456
+C003,2025-09-10T13:11:01Z,web,login,S789

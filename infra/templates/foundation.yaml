@@ -1,0 +1,335 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CDI Segmentation Foundation (buckets, KMS, IAM, OIDC, Glue DB, Grafana)
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: "Optional email address to subscribe to the CDI SNS topic"
+  SlackWorkspaceId:
+    Type: String
+    Default: ""
+    Description: "Optional Slack workspace ID for AWS Chatbot (e.g., T0XXXXXXX)"
+  SlackChannelId:
+    Type: String
+    Default: ""
+    Description: "Optional Slack channel ID for AWS Chatbot (e.g., C0XXXXXXX)"
+  ChatbotIAMRoleArn:
+    Type: String
+    Default: ""
+    Description: "Optional IAM role ARN for Chatbot to access CloudWatch & SNS (create via AWS Chatbot console)"
+
+  RepoOwner:
+    Type: String
+    Description: GitHub org/user for OIDC trust (e.g., your-github-user-or-org)
+  RepoName:
+    Type: String
+    Description: GitHub repository name (e.g., cdi-segmentation-repo)
+  BranchName:
+    Type: String
+    Default: main
+  AthenaWorkGroupName:
+    Type: String
+    Default: CDIWorkGroup
+
+Conditions:
+  HasAlertEmail: 
+    Fn::Not: [ Fn::Equals: [ !Ref AlertEmail, "" ] ]
+  HasSlack: 
+    Fn::And: 
+      - Fn::Not: [ Fn::Equals: [ !Ref SlackWorkspaceId, "" ] ]
+      - Fn::Not: [ Fn::Equals: [ !Ref SlackChannelId, "" ] ]
+      - Fn::Not: [ Fn::Equals: [ !Ref ChatbotIAMRoleArn, "" ] ]
+
+Resources:
+
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for CDI data
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: 'kms:*'
+            Resource: '*'
+      EnableKeyRotation: true
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvName}-cdi-artifacts-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKey
+      VersioningConfiguration:
+        Status: Enabled
+
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvName}-cdi-raw-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKey
+      VersioningConfiguration:
+        Status: Enabled
+
+  CuratedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvName}-cdi-curated-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKey
+      VersioningConfiguration:
+        Status: Enabled
+
+  FeaturesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvName}-cdi-features-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKey
+      VersioningConfiguration:
+        Status: Enabled
+
+  ScoresBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvName}-cdi-scores-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKey
+      VersioningConfiguration:
+        Status: Enabled
+
+  ExportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvName}-cdi-exports-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKey
+      VersioningConfiguration:
+        Status: Enabled
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${EnvName}_cdi_db'
+        Description: Database for CDI datasets
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvName}-cdi-alerts'
+
+  EmailSubscription:
+    Condition: HasAlertEmail
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref SNSTopic
+      Endpoint: !Ref AlertEmail
+
+  OidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - '6938fd4d98bab03faadb97b34396831e3780aea1'  # GitHub OIDC root CA
+
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvName}-cdi-github-actions-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref OidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${RepoOwner}/${RepoName}:ref:refs/heads/${BranchName}'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvName}-cdi-glue-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: glue-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - glue:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvName}-cdi-sagemaker-exec-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: sagemaker-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvName}-cdi-stepfunctions-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: sfn-service-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:GetJob
+                  - sagemaker:CreateProcessingJob
+                  - sagemaker:DescribeProcessingJob
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:DescribeRule
+                  - iam:PassRole
+                Resource: '*'
+
+  ChatbotSlackChannel:
+    Condition: HasSlack
+    Type: AWS::Chatbot::SlackChannelConfiguration
+    Properties:
+      ConfigurationName: !Sub '${EnvName}-cdi-slack'
+      IamRoleArn: !Ref ChatbotIAMRoleArn
+      LoggingLevel: ERROR
+      SlackWorkspaceId: !Ref SlackWorkspaceId
+      SlackChannelId: !Ref SlackChannelId
+      SnsTopicArns:
+        - !Ref SNSTopic
+
+  GrafanaWorkspace:
+    Type: AWS::Grafana::Workspace
+    Properties:
+      AccountAccessType: CURRENT_ACCOUNT
+      AuthenticationProviders: [ "AWS_SSO" ]
+      DataSources: [ "CLOUDWATCH", "ATHENA" ]
+      Name: !Sub '${EnvName}-cdi-grafana'
+      PermissionType: SERVICE_MANAGED
+
+Outputs:
+  SNSTopicArn:
+    Value: !Ref SNSTopic
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  RawBucketName:
+    Value: !Ref RawBucket
+  CuratedBucketName:
+    Value: !Ref CuratedBucket
+  FeaturesBucketName:
+    Value: !Ref FeaturesBucket
+  ScoresBucketName:
+    Value: !Ref ScoresBucket
+  ExportsBucketName:
+    Value: !Ref ExportsBucket
+  GlueDatabaseName:
+    Value: !GetAtt GlueDatabase.DatabaseInput.Name
+  GitHubActionsRoleArn:
+    Value: !GetAtt GitHubActionsRole.Arn
+  StepFunctionsRoleArn:
+    Value: !GetAtt StepFunctionsRole.Arn
+  SageMakerExecutionRoleArn:
+    Value: !GetAtt SageMakerExecutionRole.Arn
+  GrafanaUrl:
+    Value: !GetAtt GrafanaWorkspace.Endpoint
+  SlackChannelConfigured:
+    Value: !If [ HasSlack, "true", "false" ]
+  EmailSubscriptionConfigured:
+    Value: !If [ HasAlertEmail, "true", "false" ]

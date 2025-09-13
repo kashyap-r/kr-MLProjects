@@ -1,0 +1,67 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Optional QuickSight datasource + dataset for CDI (requires QuickSight Enterprise + admin setup)
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+  QuickSightPrincipalArn:
+    Type: String
+    Description: 'ARN of QuickSight user or group to own resources (e.g., arn:aws:quicksight:region:acct:user/default/you)'
+  AthenaWorkGroupName:
+    Type: String
+    Default: CDIWorkGroup
+  AthenaDataCatalog:
+    Type: String
+    Default: AwsDataCatalog
+  GlueDatabaseName:
+    Type: String
+    Default: dev_cdi_db
+
+Resources:
+  AthenaSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Sub '${EnvName}-cdi-athena-ds'
+      Name: !Sub '${EnvName}-cdi-athena-ds'
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: !Ref AthenaWorkGroupName
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions: [ "quicksight:DescribeDataSource", "quicksight:UpdateDataSourcePermissions", "quicksight:PassDataSource",
+                     "quicksight:DescribeDataSourcePermissions", "quicksight:UpdateDataSource", "quicksight:DeleteDataSource" ]
+
+  SegmentsDataset:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub '${EnvName}-cdi-segments-ds'
+      Name: !Sub '${EnvName}-cdi-segments-ds'
+      ImportMode: SPICE
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions: [ "quicksight:DescribeDataSet", "quicksight:UpdateDataSetPermissions", "quicksight:PassDataSet",
+                     "quicksight:DescribeDataSetPermissions", "quicksight:DeleteDataSet", "quicksight:UpdateDataSet", "quicksight:CreateIngestion" ]
+      PhysicalTableMap:
+        t1:
+          RelationalTable:
+            DataSourceArn: !GetAtt AthenaSource.Arn
+            Catalog: !Ref AthenaDataCatalog
+            Schema: !Ref GlueDatabaseName
+            Name: v_cdi_segments
+            InputColumns:
+              - Name: customer_id
+                Type: STRING
+              - Name: cdi
+                Type: INTEGER
+              - Name: segment
+                Type: INTEGER
+              - Name: dt
+                Type: STRING
+
+Outputs:
+  QuickSightDataSetId:
+    Value: !Ref SegmentsDataset

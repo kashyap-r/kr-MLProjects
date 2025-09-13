@@ -1,0 +1,88 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "CDI Mean",
+      "options": {
+        "legend": {
+          "showLegend": true
+        }
+      },
+      "targets": [
+        {
+          "expression": "",
+          "region": "default",
+          "namespace": "CDI",
+          "metricName": "CDI_Mean",
+          "period": "",
+          "refId": "A",
+          "stat": "Average"
+        }
+      ],
+      "datasource": {
+        "type": "cloudwatch",
+        "uid": "cloudwatch"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "CDI StdDev",
+      "options": {
+        "legend": {
+          "showLegend": true
+        }
+      },
+      "targets": [
+        {
+          "expression": "",
+          "region": "default",
+          "namespace": "CDI",
+          "metricName": "CDI_StdDev",
+          "period": "",
+          "refId": "A",
+          "stat": "Average"
+        }
+      ],
+      "datasource": {
+        "type": "cloudwatch",
+        "uid": "cloudwatch"
+      }
+    }
+  ],
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": [
+    "cdi",
+    "segmentation"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "timezone": "",
+  "title": "CDI Segmentation Overview",
+  "version": 1
+}

@@ -1,0 +1,4 @@
+ticket_id,customer_id,opened_ts,opened_via,resolved_via,resolve_secs
+T1,C001,2025-09-05T10:00:00Z,app,app,600
+T2,C002,2025-09-06T12:00:00Z,phone,branch,28800
+T3,C003,2025-09-07T12:00:00Z,web,chat,1200

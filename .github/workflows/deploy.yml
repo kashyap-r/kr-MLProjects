@@ -1,0 +1,111 @@
+name: Deploy CDI Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: 'Environment (dev|prod)'
+        required: true
+        default: 'dev'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # for OIDC
+      contents: read
+    env:
+      AWS_REGION: ap-south-1
+      ENV_NAME: ${{ github.event.inputs.env }}
+      ARTIFACT_PREFIX: ${{ github.sha }}
+      REPO_OWNER: ${{ github.repository_owner }}
+      REPO_NAME: ${{ github.event.repository.name }}
+      BRANCH_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.ENV_NAME }}-cdi-github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy Foundation Stack
+        run: |
+          aws cloudformation deploy             --stack-name $ENV_NAME-cdi-foundation             --template-file infra/templates/foundation.yaml             --capabilities CAPABILITY_NAMED_IAM             --parameter-overrides EnvName=$ENV_NAME RepoOwner=$REPO_OWNER RepoName=$REPO_NAME BranchName=$BRANCH_NAME
+
+      - name: Get Foundation Outputs
+        id: outs
+        run: |
+          OUT=$(aws cloudformation describe-stacks --stack-name $ENV_NAME-cdi-foundation --query "Stacks[0].Outputs")
+          echo "$OUT" > /tmp/outs.json
+          python - << 'PY'
+import json, os
+outs = {o['OutputKey']:o['OutputValue'] for o in json.load(open('/tmp/outs.json'))}
+for k,v in outs.items():
+    print(f"::set-output name={k}::{v}")
+PY
+
+      - name: Upload Artifacts to S3
+        run: |
+          ARTIFACT_BUCKET=$(jq -r '.[] | select(.OutputKey=="ArtifactBucketName") | .OutputValue' /tmp/outs.json)
+          aws s3 sync ml s3://$ARTIFACT_BUCKET/$ARTIFACT_PREFIX/ml
+          aws s3 sync etl s3://$ARTIFACT_BUCKET/$ARTIFACT_PREFIX/etl
+          aws s3 sync grafana s3://$ARTIFACT_BUCKET/$ARTIFACT_PREFIX/grafana
+          aws s3 sync orchestration s3://$ARTIFACT_BUCKET/$ARTIFACT_PREFIX/orchestration
+
+      - name: Deploy Pipeline Stack
+        run: |
+
+          ARTIFACT_BUCKET=$(jq -r '.[] | select(.OutputKey=="ArtifactBucketName") | .OutputValue' /tmp/outs.json)
+          RAW_BUCKET=$(jq -r '.[] | select(.OutputKey=="RawBucketName") | .OutputValue' /tmp/outs.json)
+          CURATED_BUCKET=$(jq -r '.[] | select(.OutputKey=="CuratedBucketName") | .OutputValue' /tmp/outs.json)
+          FEATURES_BUCKET=$(jq -r '.[] | select(.OutputKey=="FeaturesBucketName") | .OutputValue' /tmp/outs.json)
+          SCORES_BUCKET=$(jq -r '.[] | select(.OutputKey=="ScoresBucketName") | .OutputValue' /tmp/outs.json)
+          GLUE_DB=$(jq -r '.[] | select(.OutputKey=="GlueDatabaseName") | .OutputValue' /tmp/outs.json)
+          SFN_ROLE=$(jq -r '.[] | select(.OutputKey=="StepFunctionsRoleArn") | .OutputValue' /tmp/outs.json)
+          SM_ROLE=$(jq -r '.[] | select(.OutputKey=="SageMakerExecutionRoleArn") | .OutputValue' /tmp/outs.json)
+
+          # Choose the SKLearn container for your region:
+          IMAGE_URI=763104351884.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py310
+
+          aws cloudformation deploy             --stack-name $ENV_NAME-cdi-pipeline             --template-file infra/templates/pipeline.yaml             --capabilities CAPABILITY_NAMED_IAM             --parameter-overrides               EnvName=$ENV_NAME               ArtifactBucketName=$ARTIFACT_BUCKET               ArtifactPrefix=$ARTIFACT_PREFIX               RawBucketName=$RAW_BUCKET               CuratedBucketName=$CURATED_BUCKET               FeaturesBucketName=$FEATURES_BUCKET               ScoresBucketName=$SCORES_BUCKET               GlueDatabaseName=$GLUE_DB               GlueJobRoleArn=arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.ENV_NAME }}-cdi-glue-role               StepFunctionsRoleArn=$SFN_ROLE               SageMakerExecutionRoleArn=$SM_ROLE               SageMakerImageUri=$IMAGE_URI
+
+      - name: Kick a test run (optional)
+        run: |
+          SM_ARN=$(aws cloudformation describe-stacks --stack-name $ENV_NAME-cdi-pipeline --query "Stacks[0].Outputs[?OutputKey=='StateMachineArn'].OutputValue" --output text)
+          DATE=$(date -u +%F)
+          aws stepfunctions start-execution --state-machine-arn "$SM_ARN" --input "{\"as_of_date\": \"$DATE\"}"
+
+      - name: Create Athena Tables/View
+        run: |
+          RAW_BUCKET=$(jq -r '.[] | select(.OutputKey=="RawBucketName") | .OutputValue' /tmp/outs.json)
+          SCORES_BUCKET=$(jq -r '.[] | select(.OutputKey=="ScoresBucketName") | .OutputValue' /tmp/outs.json)
+          GLUE_DB=$(jq -r '.[] | select(.OutputKey=="GlueDatabaseName") | .OutputValue' /tmp/outs.json)
+          WG="CDIWorkGroup"
+          Q1="CREATE EXTERNAL TABLE IF NOT EXISTS ${GLUE_DB}.cdi_daily (customer_id string, asof_date string, cdi int) PARTITIONED BY (dt string) ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe' WITH SERDEPROPERTIES ('serialization.format' = ',', 'field.delim' = ',') LOCATION 's3://${SCORES_BUCKET}/cdi_daily/' TBLPROPERTIES ('skip.header.line.count'='1');"
+          Q2="CREATE EXTERNAL TABLE IF NOT EXISTS ${GLUE_DB}.cdi_segments_daily (customer_id string, cdi int, segment int) PARTITIONED BY (dt string) ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe' WITH SERDEPROPERTIES ('serialization.format' = ',', 'field.delim' = ',') LOCATION 's3://${SCORES_BUCKET}/cdi_segments_daily/' TBLPROPERTIES ('skip.header.line.count'='1');"
+          Q3="CREATE OR REPLACE VIEW ${GLUE_DB}.v_cdi_segments AS SELECT customer_id, cdi, segment, dt FROM ${GLUE_DB}.cdi_segments_daily;"
+          OUTLOC="s3://$ENV_NAME-cdi-artifacts-${{ secrets.AWS_ACCOUNT_ID }}-${{ env.AWS_REGION }}/athena-results/"
+          aws athena start-query-execution --query-string "$Q1" --work-group "$WG" --query-execution-context Database="$GLUE_DB" --result-configuration OutputLocation="$OUTLOC"
+          aws athena start-query-execution --query-string "$Q2" --work-group "$WG" --query-execution-context Database="$GLUE_DB" --result-configuration OutputLocation="$OUTLOC"
+          aws athena start-query-execution --query-string "$Q3" --work-group "$WG" --query-execution-context Database="$GLUE_DB" --result-configuration OutputLocation="$OUTLOC"
+
+      - name: Deploy QuickSight (optional)
+        if: ${{ vars.QS_PRINCIPAL_ARN != '' }}
+        run: |
+          aws cloudformation deploy \
+            --stack-name $ENV_NAME-cdi-quicksight \
+            --template-file infra/templates/quicksight.yaml \
+            --parameter-overrides \
+              EnvName=$ENV_NAME \
+              QuickSightPrincipalArn=${{ vars.QS_PRINCIPAL_ARN }} \
+              GlueDatabaseName=$(jq -r '.[] | select(.OutputKey=="GlueDatabaseName") | .OutputValue' /tmp/outs.json)
+
+      - name: Upload Sample Data (optional)
+        if: ${{ vars.UPLOAD_SAMPLE_DATA == 'true' }}
+        run: |
+          RAW_BUCKET=$(jq -r '.[] | select(.OutputKey=="RawBucketName") | .OutputValue' /tmp/outs.json)
+          TODAY=$(date -u +%F)
+          aws s3 cp --recursive data/sample/ s3://$RAW_BUCKET/ingest_date=$TODAY/

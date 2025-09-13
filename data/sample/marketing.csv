@@ -1,0 +1,4 @@
+customer_id,ts,event,campaign_id
+C001,2025-09-02T18:00:00Z,webinar_attended,W001
+C002,2025-09-03T10:05:00Z,email_click,M123
+C003,2025-09-04T09:00:00Z,webinar_attended,W002

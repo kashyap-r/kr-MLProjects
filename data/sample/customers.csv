@@ -1,0 +1,4 @@
+customer_id,kyc_completed_digital,onboard_date,primary_branch_id,has_robo_advice
+C001,1,2023-02-10,B101,1
+C002,0,2022-08-21,B015,0
+C003,1,2024-03-12,B020,0

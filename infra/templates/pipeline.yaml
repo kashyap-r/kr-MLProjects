@@ -1,0 +1,484 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CDI Segmentation Pipeline (Glue Jobs, Step Functions, EventBridge)
+
+Parameters:
+  EnvName:
+  SNSTopicArn:
+    Type: String
+  AthenaWorkGroupName:
+    Type: String
+    Default: CDIWorkGroup
+
+    Type: String
+    Default: dev
+  ArtifactBucketName:
+    Type: String
+  ArtifactPrefix:
+    Type: String
+    Description: e.g., the Git commit SHA used to version artifacts in S3
+  RawBucketName:
+    Type: String
+  CuratedBucketName:
+    Type: String
+  FeaturesBucketName:
+    Type: String
+  ScoresBucketName:
+    Type: String
+  GlueDatabaseName:
+    Type: String
+  GlueJobRoleArn:
+    Type: String
+  StepFunctionsRoleArn:
+    Type: String
+  SageMakerExecutionRoleArn:
+    Type: String
+  SageMakerImageUri:
+    Type: String
+    Description: sagemaker-scikit-learn image URI (region-specific)
+  ScheduleExpression:
+    Type: String
+    Default: cron(30 19 * * ? *) # 01:00 IST (19:30 UTC)
+
+Resources:
+
+  CurateGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${EnvName}-cdi-curate'
+      Role: !Ref GlueJobRoleArn
+      GlueVersion: '4.0'
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ArtifactBucketName}/${ArtifactPrefix}/etl/glue_jobs/curate_raw_to_curated.py'
+      DefaultArguments:
+        --job-language: python
+        --enable-metrics: 'true'
+        --enable-continuous-cloudwatch-log: 'true'
+        --RAW_BUCKET: !Ref RawBucketName
+        --CURATED_BUCKET: !Ref CuratedBucketName
+        --DB_NAME: !Ref GlueDatabaseName
+
+  FeaturesGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${EnvName}-cdi-features'
+      Role: !Ref GlueJobRoleArn
+      GlueVersion: '4.0'
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ArtifactBucketName}/${ArtifactPrefix}/etl/glue_jobs/build_features.py'
+      DefaultArguments:
+        --job-language: python
+        --enable-metrics: 'true'
+        --enable-continuous-cloudwatch-log: 'true'
+        --CURATED_BUCKET: !Ref CuratedBucketName
+        --FEATURES_BUCKET: !Ref FeaturesBucketName
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${EnvName}-cdi-batch'
+      RoleArn: !Ref StepFunctionsRoleArn
+      DefinitionString:
+        Fn::Sub: |
+          {
+            "Comment": "CDI batch pipeline",
+            "StartAt": "CurateRaw",
+            "States": {
+              "CurateRaw": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                "Parameters": {
+                  "JobName": "${EnvName}-cdi-curate",
+                  "Arguments": {
+                    "--AS_OF_DATE.$": "$.as_of_date"
+                  }
+                },
+                "Next": "BuildFeatures"
+              },
+              "BuildFeatures": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                "Parameters": {
+                  "JobName": "${EnvName}-cdi-features",
+                  "Arguments": {
+                    "--AS_OF_DATE.$": "$.as_of_date"
+                  }
+                },
+                "Next": "ComputeCDI"
+              },
+              "ComputeCDI": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sagemaker:createProcessingJob.sync",
+                "Parameters": {
+                  "ProcessingJobName.$": "States.Format('${EnvName}-compute-cdi-{}', $.as_of_date)",
+                  "AppSpecification": {
+                    "ImageUri": "${SageMakerImageUri}",
+                    "ContainerEntrypoint": ["python", "/opt/ml/processing/input/code/compute_cdi.py"]
+                  },
+                  "RoleArn": "${SageMakerExecutionRoleArn}",
+                  "ProcessingInputs": [
+                    {
+                      "InputName": "code",
+                      "S3Input": {
+                        "S3Uri": "s3://${ArtifactBucketName}/${ArtifactPrefix}/ml/processing",
+                        "LocalPath": "/opt/ml/processing/input/code",
+                        "S3DataType": "S3Prefix",
+                        "S3InputMode": "File"
+                      }
+                    },
+                    {
+                      "InputName": "features",
+                      "S3Input": {
+                        "S3Uri.$": "States.Format('s3://${FeaturesBucketName}/dt={}', $.as_of_date)",
+                        "LocalPath": "/opt/ml/processing/input/features",
+                        "S3DataType": "S3Prefix",
+                        "S3InputMode": "File"
+                      }
+                    }
+                  ],
+                  "ProcessingOutputConfig": {
+                    "Outputs": [
+                      {
+                        "OutputName": "cdi",
+                        "S3Output": {
+                          "S3Uri.$": "States.Format('s3://${ScoresBucketName}/cdi_daily/dt={}', $.as_of_date)",
+                          "LocalPath": "/opt/ml/processing/output/cdi",
+                          "S3UploadMode": "EndOfJob"
+                        }
+                      }
+                    ]
+                  },
+                  "Environment": {
+                    "AS_OF_DATE.$": "$.as_of_date",
+                    "SCORES_BUCKET": "${ScoresBucketName}"
+                  },
+                  "Environment": {
+                    "AS_OF_DATE.$": "$.as_of_date",
+                    "SCORES_BUCKET": "${ScoresBucketName}"
+                  },
+                  "ProcessingResources": {
+                    "ClusterConfig": {
+                      "InstanceCount": 1,
+                      "InstanceType": "ml.m5.xlarge",
+                      "VolumeSizeInGB": 20
+                    }
+                  },
+                  "Environment": {
+                    "AS_OF_DATE.$": "$.as_of_date"
+                  }
+                },
+                "Next": "TrainModel"
+              },
+              "TrainModel": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sagemaker:createProcessingJob.sync",
+                "Parameters": {
+                  "ProcessingJobName.$": "States.Format('${EnvName}-train-{}', $.as_of_date)",
+                  "AppSpecification": {
+                    "ImageUri": "${SageMakerImageUri}",
+                    "ContainerEntrypoint": ["python", "/opt/ml/processing/input/code/train_pca_kmeans.py"]
+                  },
+                  "RoleArn": "${SageMakerExecutionRoleArn}",
+                  "ProcessingInputs": [
+                    {
+                      "InputName": "code",
+                      "S3Input": {
+                        "S3Uri": "s3://${ArtifactBucketName}/${ArtifactPrefix}/ml/training",
+                        "LocalPath": "/opt/ml/processing/input/code",
+                        "S3DataType": "S3Prefix",
+                        "S3InputMode": "File"
+                      }
+                    },
+                    {
+                      "InputName": "features_all",
+                      "S3Input": {
+                        "S3Uri": "s3://${FeaturesBucketName}",
+                        "LocalPath": "/opt/ml/processing/input/features_all",
+                        "S3DataType": "S3Prefix",
+                        "S3InputMode": "File"
+                      }
+                    }
+                  ],
+                  "ProcessingOutputConfig": {
+                    "Outputs": [
+                      {
+                        "OutputName": "artifacts",
+                        "S3Output": {
+                          "S3Uri.$": "States.Format('s3://${ArtifactBucketName}/${ArtifactPrefix}/models/as_of={}', $.as_of_date)",
+                          "LocalPath": "/opt/ml/processing/output/artifacts",
+                          "S3UploadMode": "EndOfJob"
+                        }
+                      }
+                    ]
+                  },
+                  "Environment": {
+                    "AS_OF_DATE.$": "$.as_of_date",
+                    "SCORES_BUCKET": "${ScoresBucketName}"
+                  },
+                  "Environment": {
+                    "AS_OF_DATE.$": "$.as_of_date",
+                    "SCORES_BUCKET": "${ScoresBucketName}"
+                  },
+                  "ProcessingResources": {
+                    "ClusterConfig": {
+                      "InstanceCount": 1,
+                      "InstanceType": "ml.m5.xlarge",
+                      "VolumeSizeInGB": 20
+                    }
+                  },
+                  "Environment": {
+                    "TRAINING_DAYS": "90"
+                  }
+                },
+                "Next": "BatchInference"
+              },
+              "BatchInference": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sagemaker:createProcessingJob.sync",
+                "Parameters": {
+                  "ProcessingJobName.$": "States.Format('${EnvName}-inference-{}', $.as_of_date)",
+                  "AppSpecification": {
+                    "ImageUri": "${SageMakerImageUri}",
+                    "ContainerEntrypoint": ["python", "/opt/ml/processing/input/code/batch_assign_segments.py"]
+                  },
+                  "RoleArn": "${SageMakerExecutionRoleArn}",
+                  "ProcessingInputs": [
+                    {
+                      "InputName": "code",
+                      "S3Input": {
+                        "S3Uri": "s3://${ArtifactBucketName}/${ArtifactPrefix}/ml/inference",
+                        "LocalPath": "/opt/ml/processing/input/code",
+                        "S3DataType": "S3Prefix",
+                        "S3InputMode": "File"
+                      }
+                    },
+                    {
+                      "InputName": "features_today",
+                      "S3Input": {
+                        "S3Uri.$": "States.Format('s3://${FeaturesBucketName}/dt={}', $.as_of_date)",
+                        "LocalPath": "/opt/ml/processing/input/features_today",
+                        "S3DataType": "S3Prefix",
+                        "S3InputMode": "File"
+                      }
+                    },
+                    {
+                      "InputName": "cdi_today",
+                      "S3Input": {
+                        "S3Uri.$": "States.Format('s3://${ScoresBucketName}/cdi_daily/dt={}', $.as_of_date)",
+                        "LocalPath": "/opt/ml/processing/input/cdi_today",
+                        "S3DataType": "S3Prefix",
+                        "S3InputMode": "File"
+                      }
+                    },
+                    {
+                      "InputName": "model_artifacts",
+                      "S3Input": {
+                        "S3Uri.$": "States.Format('s3://${ArtifactBucketName}/${ArtifactPrefix}/models/as_of={}', $.as_of_date)",
+                        "LocalPath": "/opt/ml/processing/input/model_artifacts",
+                        "S3DataType": "S3Prefix",
+                        "S3InputMode": "File"
+                      }
+                    }
+                  ],
+                  "ProcessingOutputConfig": {
+                    "Outputs": [
+                      {
+                        "OutputName": "segments",
+                        "S3Output": {
+                          "S3Uri.$": "States.Format('s3://${ScoresBucketName}/cdi_segments_daily/dt={}', $.as_of_date)",
+                          "LocalPath": "/opt/ml/processing/output/segments",
+                          "S3UploadMode": "EndOfJob"
+                        }
+                      }
+                    ]
+                  },
+                  "Environment": {
+                    "AS_OF_DATE.$": "$.as_of_date",
+                    "SCORES_BUCKET": "${ScoresBucketName}"
+                  },
+                  "Environment": {
+                    "AS_OF_DATE.$": "$.as_of_date",
+                    "SCORES_BUCKET": "${ScoresBucketName}"
+                  },
+                  "ProcessingResources": {
+                    "ClusterConfig": {
+                      "InstanceCount": 1,
+                      "InstanceType": "ml.m5.xlarge",
+                      "VolumeSizeInGB": 20
+                    }
+                  }
+                },
+                "Next": "ComputeMetrics"
+              },
+              "ComputeMetrics": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sagemaker:createProcessingJob.sync",
+                "Parameters": {
+                  "ProcessingJobName.$": "States.Format('${EnvName}-metrics-{}', $.as_of_date)",
+                  "AppSpecification": {
+                    "ImageUri": "${SageMakerImageUri}",
+                    "ContainerEntrypoint": ["python", "/opt/ml/processing/input/code/metrics_monitor.py"]
+                  },
+                  "RoleArn": "${SageMakerExecutionRoleArn}",
+                  "ProcessingInputs": [
+                    {
+                      "InputName": "code",
+                      "S3Input": {
+                        "S3Uri": "s3://${ArtifactBucketName}/${ArtifactPrefix}/ml/processing",
+                        "LocalPath": "/opt/ml/processing/input/code",
+                        "S3DataType": "S3Prefix",
+                        "S3InputMode": "File"
+                      }
+                    },
+                    {
+                      "InputName": "segments_today",
+                      "S3Input": {
+                        "S3Uri.$": "States.Format('s3://${ScoresBucketName}/cdi_segments_daily/dt={}', $.as_of_date)",
+                        "LocalPath": "/opt/ml/processing/input/segments_today",
+                        "S3DataType": "S3Prefix",
+                        "S3InputMode": "File"
+                      }
+                    }
+                  ],
+                  "ProcessingOutputConfig": {
+                    "Outputs": []
+                  },
+                  "Environment": {
+                    "AS_OF_DATE.$": "$.as_of_date",
+                    "SCORES_BUCKET": "${ScoresBucketName}"
+                  },
+                  "Environment": {
+                    "AS_OF_DATE.$": "$.as_of_date",
+                    "SCORES_BUCKET": "${ScoresBucketName}"
+                  },
+                  "ProcessingResources": {
+                    "ClusterConfig": {
+                      "InstanceCount": 1,
+                      "InstanceType": "ml.m5.large",
+                      "VolumeSizeInGB": 10
+                    }
+                  }
+                },
+                "End": true
+              }
+            }
+          }
+
+  DailySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvName}-cdi-schedule'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !Ref StateMachine
+          Id: CDIStateMachineTarget
+          RoleArn: !Ref StepFunctionsRoleArn
+          Input: !Sub |
+            { "as_of_date": "${!aws:CurrentDate}" }
+
+
+  AthenaCdiDailyTable:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref GlueDatabaseName
+      Name: !Sub '${EnvName}_create_cdi_daily_table'
+      Description: Create external table for cdi_daily (csv)
+      QueryString: !Sub |
+        CREATE EXTERNAL TABLE IF NOT EXISTS ${GlueDatabaseName}.cdi_daily (
+          customer_id string,
+          asof_date string,
+          cdi int
+        )
+        PARTITIONED BY (dt string)
+        ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
+        WITH SERDEPROPERTIES ('serialization.format' = ',','field.delim' = ',')
+        LOCATION 's3://${ScoresBucketName}/cdi_daily/'
+        TBLPROPERTIES ('skip.header.line.count'='1');
+
+  AthenaSegmentsTable:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref GlueDatabaseName
+      Name: !Sub '${EnvName}_create_cdi_segments_table'
+      Description: Create external table for cdi_segments_daily (csv)
+      QueryString: !Sub |
+        CREATE EXTERNAL TABLE IF NOT EXISTS ${GlueDatabaseName}.cdi_segments_daily (
+          customer_id string,
+          cdi int,
+          segment int
+        )
+        PARTITIONED BY (dt string)
+        ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
+        WITH SERDEPROPERTIES ('serialization.format' = ',','field.delim' = ',')
+        LOCATION 's3://${ScoresBucketName}/cdi_segments_daily/'
+        TBLPROPERTIES ('skip.header.line.count'='1');
+
+  AthenaSegmentsView:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref GlueDatabaseName
+      Name: !Sub '${EnvName}_create_segments_view'
+      Description: Create a simple view over segments with dt exposed
+      QueryString: !Sub |
+        CREATE OR REPLACE VIEW ${GlueDatabaseName}.v_cdi_segments AS
+        SELECT customer_id, cdi, segment, dt
+        FROM ${GlueDatabaseName}.cdi_segments_daily;
+
+  RunCompletedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvName}-cdi-runcompleted-missing'
+      AlarmDescription: Alarm if daily run hasn't published RunCompleted metric (treat missing as breaching) 
+      Namespace: 'CDI'
+      MetricName: 'RunCompleted'
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref SNSTopicArn
+
+  PsiCdiAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvName}-cdi-psi-cdi-high'
+      AlarmDescription: Alarm when PSI between today's CDI distribution and yesterday exceeds 0.2
+      Namespace: 'CDI'
+      MetricName: 'PSI_CDI'
+      Statistic: Average
+      Period: 86400
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0.2
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SNSTopicArn
+
+  SegmentChurnAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvName}-cdi-segment-churn-high'
+      AlarmDescription: Alarm when segment churn vs yesterday exceeds 25%
+      Namespace: 'CDI'
+      MetricName: 'Segment_Churn'
+      Statistic: Average
+      Period: 86400
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0.25
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SNSTopicArn
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref StateMachine
