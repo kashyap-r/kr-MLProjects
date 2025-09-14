@@ -296,14 +296,14 @@ Resources:
       SnsTopicArns:
         - !Ref SNSTopic
 
-  GrafanaWorkspace:
-    Type: AWS::Grafana::Workspace
-    Properties:
-      AccountAccessType: CURRENT_ACCOUNT
-      AuthenticationProviders: [ "AWS_SSO" ]
-      DataSources: [ "CLOUDWATCH", "ATHENA" ]
-      Name: !Sub '${EnvName}-cdi-grafana'
-      PermissionType: SERVICE_MANAGED
+#  GrafanaWorkspace:
+#    Type: AWS::Grafana::Workspace
+#    Properties:
+#      AccountAccessType: CURRENT_ACCOUNT
+#      AuthenticationProviders: [ "AWS_SSO" ]
+#      DataSources: [ "CLOUDWATCH", "ATHENA" ]
+#      Name: !Sub '${EnvName}-cdi-grafana'
+#      PermissionType: SERVICE_MANAGED
 
 Outputs:
   SNSTopicArn:
@@ -328,8 +328,8 @@ Outputs:
     Value: !GetAtt StepFunctionsRole.Arn
   SageMakerExecutionRoleArn:
     Value: !GetAtt SageMakerExecutionRole.Arn
-  GrafanaUrl:
-    Value: !GetAtt GrafanaWorkspace.Endpoint
+#  GrafanaUrl:
+#    Value: !GetAtt GrafanaWorkspace.Endpoint
   SlackChannelConfigured:
     Value: !If [ HasSlack, "true", "false" ]
   EmailSubscriptionConfigured:
